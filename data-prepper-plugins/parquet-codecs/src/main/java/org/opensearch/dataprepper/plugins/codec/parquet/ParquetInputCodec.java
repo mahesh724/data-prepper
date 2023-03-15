@@ -1,4 +1,9 @@
-package org.opensearch.dataprepper.plugins.parquetinputcodec;
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.opensearch.dataprepper.plugins.codec.parquet;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
@@ -26,7 +31,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
-import java.util.*;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
 import java.util.function.Consumer;
 
 /**
@@ -39,60 +46,51 @@ public class ParquetInputCodec implements InputCodec {
     private static final String FILE_NAME = "parquet-data";
     private static final String FILE_SUFFIX = ".parquet";
     private static final int EMPTY_INPUT_STREAM_VALUE = 0;
-
-
     private static final Logger LOG = LoggerFactory.getLogger(ParquetInputCodec.class);
-
 
     @Override
     public void parse(InputStream inputStream, Consumer<Record<Event>> eventConsumer) throws IOException {
 
         Objects.requireNonNull(inputStream);
         Objects.requireNonNull(eventConsumer);
-
-        if(!(inputStream.available() == EMPTY_INPUT_STREAM_VALUE))
-          parseParquetStream(inputStream, eventConsumer);
+        parseParquetStream(inputStream, eventConsumer);
 
     }
 
-    private void parseParquetStream(InputStream inputStream, Consumer<Record<Event>> eventConsumer) throws IOException {
+    private void parseParquetStream(final InputStream inputStream, final Consumer<Record<Event>> eventConsumer) throws IOException {
 
-        File tempFile = File.createTempFile(FILE_NAME, FILE_SUFFIX);
+        final File tempFile = File.createTempFile(FILE_NAME, FILE_SUFFIX);
         Files.copy(inputStream, tempFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
 
-        ParquetFileReader parquetFileReader = new ParquetFileReader(HadoopInputFile.fromPath(new Path(tempFile.toURI()), new Configuration()), ParquetReadOptions.builder().build());
+        try (ParquetFileReader parquetFileReader = new ParquetFileReader(HadoopInputFile.fromPath(new Path(tempFile.toURI()), new Configuration()), ParquetReadOptions.builder().build())) {
+            final ParquetMetadata footer = parquetFileReader.getFooter();
+            final MessageType schema = createdParquetSchema(footer);
 
-        ParquetMetadata footer = parquetFileReader.getFooter();
-        MessageType schema = createdParquetSchema(footer);
+            PageReadStore pages;
 
-        List<SimpleGroup> simpleGroups = new ArrayList<>();
+            while ((pages = parquetFileReader.readNextRowGroup()) != null) {
+                final long rows = pages.getRowCount();
+                final MessageColumnIO columnIO = new ColumnIOFactory().getColumnIO(schema);
+                final RecordReader recordReader = columnIO.getRecordReader(pages, new GroupRecordConverter(schema));
 
-        PageReadStore pages;
+                final Map<String, String> eventData = new HashMap<>();
 
-        while ((pages = parquetFileReader.readNextRowGroup()) != null) {
-            long rows = pages.getRowCount();
-            MessageColumnIO columnIO = new ColumnIOFactory().getColumnIO(schema);
-            RecordReader recordReader = columnIO.getRecordReader(pages, new GroupRecordConverter(schema));
-
-            final Map<String, String> eventData = new HashMap<>();
-            eventData.put("schema",schema.toString());
-
-            for (int row = 0; row < rows; row++) {
-                SimpleGroup simpleGroup = (SimpleGroup) recordReader.read();
-                eventData.put(MESSAGE_FIELD_NAME, simpleGroup.toString());
-                final Event event = JacksonLog.builder().withData(eventData).build();
-                eventConsumer.accept(new Record<>(event));
-                simpleGroups.add(simpleGroup);
+                for (int row = 0; row < rows; row++) {
+                    final SimpleGroup simpleGroup = (SimpleGroup) recordReader.read();
+                    eventData.put(MESSAGE_FIELD_NAME, simpleGroup.toString());
+                    final Event event = JacksonLog.builder().withData(eventData).build();
+                    eventConsumer.accept(new Record<>(event));
+                }
             }
+        } catch (Exception parquetException) {
+            LOG.error("An exception occurred while parsing parquet InputStream  ", parquetException);
+        } finally {
+            Files.delete(tempFile.toPath());
         }
-        parquetFileReader.close();
-        tempFile.delete();
-
     }
 
     private MessageType createdParquetSchema(ParquetMetadata parquetMetadata) {
-        MessageType schema = parquetMetadata.getFileMetaData().getSchema();
-        return schema;
+        return parquetMetadata.getFileMetaData().getSchema();
     }
 
 }

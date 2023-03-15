@@ -1,10 +1,17 @@
-package org.opensearch.dataprepper.plugins.parquetinputcodec;
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.opensearch.dataprepper.plugins.codec.parquet;
 
 import net.bytebuddy.utility.RandomString;
 import org.apache.hadoop.fs.FileSystem;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
@@ -22,8 +29,10 @@ import org.apache.parquet.avro.AvroParquetWriter;
 import org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 
-import java.io.*;
-import java.nio.file.Files;
+import java.io.ByteArrayInputStream;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -33,16 +42,26 @@ import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.mockito.Mockito.*;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.times;
 
+
+
 @ExtendWith(MockitoExtension.class)
-public class parquetInputCodecTest {
+class ParquetInputCodecTest {
 
     @Mock
     private Consumer<Record<Event>> eventConsumer;
 
     private ParquetInputCodec parquetInputCodec;
+    private static FileInputStream fileInputStream;
+
+    private static final String INVALID_PARQUET_INPUT_STREAM = "Invalid Parquet Input Stream";
+
+    @TempDir
+    private static java.nio.file.Path path;
 
     private ParquetInputCodec createObjectUnderTest() {
         return new ParquetInputCodec();
@@ -62,7 +81,7 @@ public class parquetInputCodecTest {
     }
 
     @Test
-    void parse_with_null_Consumer_throws() throws IOException {
+    void parse_with_null_Consumer_throws()  {
         parquetInputCodec = createObjectUnderTest();
 
         final InputStream inputStream = mock(InputStream.class);
@@ -78,8 +97,16 @@ public class parquetInputCodecTest {
         verifyNoInteractions(eventConsumer);
     }
 
+    @Test
+    public void parse_with_Invalid_InputStream_then_catches_exception() {
+        Consumer<Record<Event>> eventConsumer = mock(Consumer.class);
+        Assertions.assertDoesNotThrow(()->
+                parquetInputCodec.parse(createInvalidParquetStream(),eventConsumer));
+
+    }
+
     @ParameterizedTest
-    @ValueSource(ints = {10})
+    @ValueSource(ints = {1,10,100,1000})
     void test_when_HappyCaseParquetInputStream_then_callsConsumerWithParsedEvents(final int numberOfRecords) throws IOException {
         InputStream inputStream = createRandomParquetStream(numberOfRecords);
 
@@ -99,11 +126,14 @@ public class parquetInputCodecTest {
             assertThat(actualRecord.getData().getMetadata().getEventType(), equalTo(EventType.LOG.toString()));
         }
 
+        fileInputStream.close();
+        FileSystem fs = FileSystem.get(new Configuration());
+        String filepath = path.toUri().getPath();
+        fs.delete(new Path(filepath));
+        fs.close();
     }
 
     private static InputStream createRandomParquetStream(int numberOfRecords) throws IOException {
-
-        Files.deleteIfExists(java.nio.file.Path.of("./test-parquet.parquet"));
 
         Schema schema = parseSchema();
         String OS = System.getProperty("os.name").toLowerCase();
@@ -115,10 +145,10 @@ public class parquetInputCodecTest {
         }
 
         List<GenericData.Record> recordList = generateRecords(schema, numberOfRecords);
-        java.nio.file.Path path = Paths.get("test-parquet.parquet");
 
+        path = Paths.get("test-parquet.parquet");
 
-        try (ParquetWriter<GenericData.Record> writer = AvroParquetWriter.<GenericData.Record>builder(new Path(path.toUri()))
+        try(ParquetWriter<GenericData.Record> writer = AvroParquetWriter.<GenericData.Record>builder(new Path(path.toUri().getPath()))
                 .withSchema(schema)
                 .withCompressionCodec(CompressionCodecName.SNAPPY)
                 .withRowGroupSize(ParquetWriter.DEFAULT_BLOCK_SIZE)
@@ -127,20 +157,12 @@ public class parquetInputCodecTest {
                 .withValidation(false)
                 .withDictionaryEncoding(false)
                 .build()) {
-
             for (GenericData.Record record : recordList) {
                 writer.write(record);
             }
-            writer.close();
-
         }
-
-        FileSystem fs = FileSystem.get(new Configuration());
-        String filepath = path.toUri().getPath();
-        InputStream parquetInputStream = new FileInputStream(path.toString());
-        fs.delete(new Path(filepath),true);
-        return parquetInputStream;
-
+        fileInputStream = new FileInputStream(path.toString());
+        return fileInputStream;
     }
 
     private static Schema parseSchema() {
@@ -169,5 +191,11 @@ public class parquetInputCodecTest {
         return recordList;
     }
 
-
+    private static InputStream createInvalidParquetStream() {
+        String OS = System.getProperty("os.name").toLowerCase();
+        if (OS.contains("win")) {
+            System.setProperty("hadoop.home.dir", Paths.get("").toAbsolutePath().toString());
+        }
+        return  new ByteArrayInputStream(INVALID_PARQUET_INPUT_STREAM.getBytes());
+    }
 }
